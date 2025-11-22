@@ -1,0 +1,20 @@
+<?xml version="1.0"?>
+<launch>
+
+  <!-- LIDAR Test Node -->
+  <node 
+      pkg="my_robot_control"
+      exec="my_robot_lidar_test_exec"
+      name="lidar_test_node"
+      output="screen">
+  </node>
+
+  <!-- Move Until Obstacle Node -->
+  <node
+      pkg="my_robot_control"
+      exec="move_until_obstacle_exec"
+      name="move_until_obstacle_node"
+      output="screen">
+  </node>
+
+</launch>
