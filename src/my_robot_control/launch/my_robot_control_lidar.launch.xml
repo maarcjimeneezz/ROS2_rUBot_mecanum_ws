@@ -1,6 +1,7 @@
 <launch>
-  <node pkg="my_robot_control"
-        executable="my_robot_control_lidar"
-        name="robot_control_lidar"
-        output="screen" />
+  <node
+    pkg="my_robot_control"
+    executable="my_robot_control_lidar"
+    name="robot_control_lidar"
+    output="screen" />
 </launch>
