@@ -35,7 +35,8 @@ setup(
             'my_robot_wallfollower_LIMO_exec = my_robot_control.my_robot_wallfollower_LIMO:main',
             'my_robot_go2pose_exec = my_robot_control.my_robot_go2pose:main',
             'my_robot_control_lidar_exec = my_robot_control.my_robot_control_lidar:main',
-            'my_robot_wallfollower_holonomic_exec = my_robot_control.my_robot_wallfollower_holonomic:main'
+            'my_robot_wallfollower_holonomic_exec = my_robot_control.my_robot_wallfollower_holonomic:main',
+            'my_robot_wallfollower_holonomic_v2_exec = my_robot_control.my_robot_wallfollower_holonomic_v2:main'
         ],
     },
 )

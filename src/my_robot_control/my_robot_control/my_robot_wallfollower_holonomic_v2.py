@@ -11,7 +11,7 @@ class WallFollower(Node):
         super().__init__('wall_follower_node')
 
         # Parameters
-        self.declare_parameter('distance_limit', 0.3)    # desired distance to right wall
+        self.declare_parameter('distance_limit', 0.25)
         self.declare_parameter('forward_speed', 0.2)
         self.declare_parameter('side_speed', 0.2)
         self.declare_parameter('rotation_speed', 0.3)
@@ -38,6 +38,8 @@ class WallFollower(Node):
 
         # Periodic cmd_vel publisher at 10 Hz (0.1 s)
         self.cmd_timer = self.create_timer(0.1, self.cmd_publish_timer_cb)
+
+        self._state_action = "Idle"
         self._last_action_logged = None
         self._shutting_down = False
 
@@ -109,40 +111,33 @@ class WallFollower(Node):
         LEFT       = []
         FR_LEFT    = []
 
+        # Clasificar los rayos del LIDAR en sectores
         for i, d in enumerate(scan.ranges):
             if not math.isfinite(d):
                 continue
             if d < scan.range_min or d > scan.range_max:
                 continue
 
-            ang = angle_min + i * angle_inc  # ang en radianes
+            ang = angle_min + i * angle_inc
 
-            # FRONT: -20° a +20°
             if -math.radians(20) <= ang <= math.radians(20):
                 FRONT.append(d)
-            # FRONT RIGHT: -60° a -20°
             elif -math.radians(60) <= ang < -math.radians(20):
                 FR_RIGHT.append(d)
-            # RIGHT: -120° a -60°
             elif -math.radians(120) <= ang < -math.radians(60):
                 RIGHT.append(d)
-            # BACK RIGHT: -160° a -120°
             elif -math.radians(160) <= ang < -math.radians(120):
                 BACK_RIGHT.append(d)
-            # FRONT LEFT: 20° a 60°
             elif math.radians(20) < ang <= math.radians(60):
                 FR_LEFT.append(d)
-            # LEFT: 60° a 120°
             elif math.radians(60) < ang <= math.radians(120):
                 LEFT.append(d)
-            # BACK LEFT: 120° a 160°
             elif math.radians(120) < ang <= math.radians(160):
                 BACK_LEFT.append(d)
-            # BACK (opcional: detrás exacta)
             else:
                 BACK.append(d)
 
-        # Minimal distances
+        # Distancias mínimas por sector
         min_front      = min(FRONT)      if FRONT      else float('inf')
         min_fr_right   = min(FR_RIGHT)   if FR_RIGHT   else float('inf')
         min_right      = min(RIGHT)      if RIGHT      else float('inf')
@@ -152,87 +147,91 @@ class WallFollower(Node):
         min_back_left  = min(BACK_LEFT)  if BACK_LEFT  else float('inf')
         min_back       = min(BACK)       if BACK       else float('inf')
 
+        # ================================
+        # 1) EMERGENCIA: obstáculo muy cercano
+        # ================================
+        closest_dist = min(min_front, min_left, min_right, min_back, 
+                        min_fr_left, min_fr_right, min_back_left, min_back_right)
 
         twist = Twist()
-        action = ""
+        if closest_dist < self.base_distance:
+            # Evitar colisión según la zona más libre
+            directions = {
+                "FRONT":      min_front,
+                "LEFT":       min_left,
+                "RIGHT":      min_right,
+                "BACK":       min_back,
+            }
+            best_zone = max(directions, key=directions.get)
 
-        mins = {
-            "FRONT":        min_front,
-            "FRONT_RIGHT":  min_fr_right,
-            "RIGHT":        min_right,
-            "BACK_RIGHT":   min_back_right,
-            "BACK":         min_back,
-            "BACK_LEFT":    min_back_left,
-            "LEFT":         min_left,
-            "FRONT_LEFT":   min_fr_left
-        }
+            if best_zone == "FRONT" or best_zone == "LEFT":
+                twist.linear.x = 0.0
+                twist.angular.z = 0.5  # girar izquierda
+                action = "EMERGENCY: Turn LEFT"
+            elif best_zone == "RIGHT":
+                twist.linear.x = 0.0
+                twist.angular.z = -0.5  # girar derecha
+                action = "EMERGENCY: Turn RIGHT"
+            else:  # BACK
+                twist.linear.x = -self.forwardSpeed
+                twist.angular.z = 0.0
+                action = "EMERGENCY: Move BACK"
 
-        closest_sector = min(mins, key=mins.get)
-        closest_dist = mins[closest_sector]
+            self.cmd = twist
+            self._state_action = action
+            return
 
-        action = f"Closest sector = {closest_sector} ({closest_dist:.2f} m)"
-
-        twist = Twist()
-
-        # 1) Si hay obstáculo delante → evitar y doblar izquierda
-        if closest_sector == "FRONT" or min_front < self.base_distance:
+        # ================================
+        # 2) OBSTÁCULO frontal normal
+        # ================================
+        if min_front < self.base_distance * 2:
             twist.linear.x = 0.0
-            twist.linear.y = +self.sideSpeed
-            twist.angular.z = +self.rotationSpeed
-            action = "Obstacle front → move LEFT and rotate LEFT"
+            twist.angular.z = 0.4  # girar a la izquierda
+            action = "Obstacle FRONT → Turn LEFT"
+            self.cmd = twist
+            self._state_action = action
+            return
 
-        else:
-            # Usamos RIGHT y BACK_RIGHT para seguir la pared
-            d_right = min_right
-            d_back_right = min_back_right
-
-            # Si no hay datos válidos, ir recto
-            if not math.isfinite(d_right):
-                d_right = float('inf')
-            if not math.isfinite(d_back_right):
-                d_back_right = float('inf')
-
-            # Error respecto a distancia ideal
-            error_dist = d_right - self.base_distance
-
-            # Estimación de ángulo de pared (inclinación)
-            # pared recta → d_right ≈ d_back_right
-            error_angle = d_right - d_back_right
-
-            # ============================
-            # 2) CONTROL LATERAL (seguir pared derecha)
-            # ============================
-            # error_dist > 0  → estamos lejos → mover derecha
-            # error_dist < 0  → estamos cerca → mover izquierda
-
-            k_side = 0.8
-            twist.linear.y = k_side * (-error_dist) * self.sideSpeed
-
-            # ============================
-            # 3) CONTROL ANGULAR (alinear con pared)
-            # ============================
-            k_ang = 1.2
-            twist.angular.z = -k_ang * error_angle * self.rotationSpeed
-
-            # ============================
-            # 4) AVANZAR SI TODO OK
-            # ============================
+        # ================================
+        # 3) OBSTÁCULO izquierdo
+        # ================================
+        if min_left < self.base_distance:
             twist.linear.x = self.forwardSpeed
+            twist.angular.z = -0.4  # corregir derecha
+            action = "Obstacle LEFT → Correct RIGHT"
+            self.cmd = twist
+            self._state_action = action
+            return
 
-            action = (
-                f"Following RIGHT wall | dist_err={error_dist:.2f} | "
-                f"angle_err={error_angle:.2f}"
-            )
+        # ================================
+        # 4) SEGUIR PARED DERECHA
+        # ================================
+        DESIRED_RIGHT_DIST = 0.25  # distancia objetivo a la pared derecha
+        if math.isfinite(min_right):
+            error_dist = min_right - DESIRED_RIGHT_DIST
 
-        # Actualizar comando
+            # Corrección basada en distancia a la pared y diferencia frontal/trasera
+            if math.isfinite(min_back_right):
+                error_angle = min_right - min_back_right
+            else:
+                error_angle = 0.0
+
+            twist.linear.x = self.forwardSpeed
+            twist.angular.z = -1.2 * error_dist - 1.0 * error_angle
+
+            action = f"Following RIGHT wall | dist_err={error_dist:.2f} | angle_err={error_angle:.2f}"
+            self.cmd = twist
+            self._state_action = action
+            return
+
+        # ================================
+        # 5) NO HAY PARED DERECHA → buscarla
+        # ================================
+        twist.linear.x = self.forwardSpeed
+        twist.angular.z = -0.5  # girar a la derecha lentamente
+        action = "Searching RIGHT wall"
         self.cmd = twist
-
-        # Logging
-        if action != self._last_action_logged:
-            self.get_logger().info(action)
-            self._last_action_logged = action
         self._state_action = action
-
 
     #--------------------------------------------------------------------
     def log_info(self):
