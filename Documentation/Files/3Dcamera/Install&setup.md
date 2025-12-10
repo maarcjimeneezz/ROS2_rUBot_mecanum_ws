@@ -9,8 +9,7 @@ The installation process in **PC Ubuntu 22**:
 ```bash
 sudo apt install -y git cmake build-essential \
   libssl-dev libusb-1.0-0-dev libudev-dev pkg-config \
-  libgtk-3-dev libglfw3-dev libgl1-mesa-dev libglu1-mesa-dev \
-  librealsense2-dkms librealsense2-utils
+  libgtk-3-dev libglfw3-dev libgl1-mesa-dev libglu1-mesa-dev 
 
 mkdir -p ~/software && cd ~/software
 git clone https://github.com/IntelRealSense/librealsense.git
@@ -20,11 +19,16 @@ mkdir build && cd build
 cmake .. -DCMAKE_BUILD_TYPE=Release -DFORCE_RSUSB_BACKEND=true -DBUILD_EXAMPLES=true
 make -j$(nproc)
 sudo make install
-
+````
+Increase the `usbfs_memory` to 512:
+```bash
+echo 'options usbcore usbfs_memory_mb=512' | sudo tee /etc/modprobe.d/usbfs_memory.conf
+sudo reboot
+```
+To test if the installation was successful, connect the camera and run:
+```bash
 realsense-viewer
 ```
-Here is interesting to change to a more stable firmware version for D435/i:
-5.12.15.50. This can be done in the "Device" tab -> "Update Firmware".
 
 To install the wrapper ROS2:
 ```bash
@@ -37,14 +41,14 @@ ros2 launch realsense2_camera rs_launch.py \
   depth_module.depth_profile:=640x360x15 \
   pointcloud.enable:=false
 ```
-When camera is on **raspberrypi** you have to:
-- add a patch to it kernel:
+When camera is on **raspberrypi**, the installation instructions are equivalent, but you have to:
+- add a patch to it kernel (after step `cd librealsense`):
   ````bash
   cd ~/software/librealsense
   sudo ./scripts/setup_udev_rules.sh
   sudo ./scripts/patch-realsense-ubuntu-lts-hwe.sh
   ````
-- Increase the ùsbfs_memory` to 512:
+- Increase the `usbfs_memory` to 512:
   - open the file:
     ```bash
     sudo nano /boot/firmware/cmdline.txt
@@ -54,8 +58,8 @@ When camera is on **raspberrypi** you have to:
     usbcore.usbfs_memory_mb=512
     ````
   - reboot the raspberrypi
-- change to a more stable firmware version for D435/i:
-5.12.15.50.
+- change to a more stable firmware version for D435/i: version
+`5.12.15.50`. This can be done in the "Device" tab -> "Update Firmware".
 
 - Use the launch file with custom parameters:
   ```bash
@@ -111,3 +115,7 @@ ros2 launch orbbec_camera dabai_a.launch.py \
   depth_width:=640  depth_height:=480  depth_fps:=15 \
   enable_point_cloud:=false
 ```
+
+Best cameras:
+- https://www.orbbec.com/products/tof-camera/femto-bolt/
+- https://www.orbbec.com/products/tof-camera/femto-mega/
