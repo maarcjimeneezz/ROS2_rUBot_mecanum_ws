@@ -11,17 +11,22 @@ class WallFollower(Node):
         super().__init__('wall_follower_node')
 
         # Parameters
-        self.declare_parameter('distance_limit', 0.25)
+        self.declare_parameter('distance_limit', 0.15)  # Reduced from 0.25 for better detection
         self.declare_parameter('forward_speed', 0.2)
         self.declare_parameter('side_speed', 0.2)
         self.declare_parameter('rotation_speed', 0.3)
-        self.declare_parameter('time_to_stop', 30.0)     # auto-stop
+        self.declare_parameter('time_to_stop', 30.0)
 
         self.base_distance = float(self.get_parameter('distance_limit').value)
         self.forwardSpeed = float(self.get_parameter('forward_speed').value)
         self.sideSpeed = self.get_parameter('side_speed').value
         self.rotationSpeed = self.get_parameter('rotation_speed').value
         self.time_to_stop = float(self.get_parameter('time_to_stop').value)
+
+        # Wall alignment parameters
+        self.DESIRED_WALL_DIST = 0.25  # Target distance to wall (meters)
+        self.ALIGNMENT_TOLERANCE = 0.02  # Tolerance for parallel alignment (meters)
+        self.FRONTAL_PRIORITY = 0.1  # Bonus distance for frontal walls (prioritize front walls)
 
         # Last commanded twist (will be published periodically)
         self.cmd = Twist()
@@ -35,18 +40,21 @@ class WallFollower(Node):
         # Timers
         self.info_timer = self.create_timer(1.0, self.log_info)
         self.stop_timer = self.create_timer(0.05, self.stop_watchdog)
-
-        # Periodic cmd_vel publisher at 10 Hz (0.1 s)
         self.cmd_timer = self.create_timer(0.1, self.cmd_publish_timer_cb)
 
         self._state_action = "Idle"
         self._last_action_logged = None
         self._shutting_down = False
 
+        # Wall alignment state machine
+        self._aligning_to_wall = False
+        self._target_wall_side = None  # "RIGHT", "LEFT", "FRONT"
+        self._target_angle_error = 0.0
+
         self.start_time_s = self.get_clock().now().nanoseconds * 1e-9
 
         self.get_logger().info(
-            "WallFollower (RIGHT tol, BACK_RIGHT when closest) - differential drive."
+            "WallFollower with wall alignment - detects walls and aligns before moving."
         )
 
     #--------------------------------------------------------------------
@@ -63,18 +71,13 @@ class WallFollower(Node):
     def stop(self):
         """Safe stop: set cmd to zero Twist, try to publish once, stop timers."""
         self._shutting_down = True
-
-        # Set last command to zero
         self.cmd = Twist()
 
-        # Try a final publish (publisher may still be valid even if shutdown started)
         try:
             self.publisher.publish(self.cmd)
         except Exception:
-            # Context/publisher may already be invalid -> ignore
             pass
 
-        # Cancel timers safely
         for t in [self.info_timer, self.stop_timer, self.cmd_timer]:
             try:
                 t.cancel()
@@ -90,51 +93,101 @@ class WallFollower(Node):
         try:
             self.publisher.publish(self.cmd)
         except Exception:
-            # If the context or publisher is invalid, ignore
             pass
+
+    #--------------------------------------------------------------------
+    def find_closest_wall(self, min_front, min_left, min_right, min_fr_left, min_fr_right):
+        """
+        Detects which wall is closest, prioritizing frontal walls in case of ties.
+        
+        Returns:
+            tuple: (closest_distance, wall_side, left_dist, right_dist)
+            wall_side: "FRONT", "LEFT", "RIGHT", or None
+            left_dist, right_dist: distances for angle calculation
+        """
+        walls = []
+
+        # Frontal wall detection (has priority bonus)
+        if math.isfinite(min_front):
+            walls.append((min_front - self.FRONTAL_PRIORITY, "FRONT", min_front, None))
+
+        # Left wall detection
+        if math.isfinite(min_left):
+            walls.append((min_left, "LEFT", min_left, min_fr_left))
+
+        # Right wall detection
+        if math.isfinite(min_right):
+            walls.append((min_right, "RIGHT", min_right, min_fr_right))
+
+        if not walls:
+            return float('inf'), None, None, None
+
+        # Sort by distance (lower first), frontal priority handled by negative bonus
+        walls.sort(key=lambda x: x[0])
+        closest_dist, wall_side, primary_dist, secondary_dist = walls[0]
+
+        return closest_dist, wall_side, primary_dist, secondary_dist
+
+    #--------------------------------------------------------------------
+    def calculate_wall_angle_error(self, primary_dist, secondary_dist, wall_side):
+        """
+        Calculate angle error for wall alignment.
+        Positive error = robot angled away from wall, needs correction toward wall.
+        
+        For RIGHT wall: primary=RIGHT distance, secondary=BACK_RIGHT distance
+        For LEFT wall: primary=LEFT distance, secondary=BACK_LEFT distance
+        For FRONT wall: no angle error (wall is perpendicular)
+        """
+        if wall_side == "FRONT":
+            return 0.0
+
+        if not math.isfinite(secondary_dist):
+            return 0.0
+
+        # error_angle = primary_dist - secondary_dist
+        # Positive = robot angled away from wall
+        return primary_dist - secondary_dist
+
+    #--------------------------------------------------------------------
+    def is_wall_aligned(self, angle_error):
+        """Check if robot is parallel to wall within tolerance."""
+        return abs(angle_error) < self.ALIGNMENT_TOLERANCE
 
     #--------------------------------------------------------------------
     def laser_callback(self, scan):
         """
-        Main control logic that processes LIDAR data and generates motion commands.
-        Uses a hierarchical finite state machine approach:
+        Main control logic with wall detection and alignment.
+        State machine:
         1. Emergency avoidance (collision imminent)
-        2. Frontal obstacle detection
-        3. Left obstacle correction
-        4. Wall following (main behavior)
-        5. Wall search (lost the wall)
+        2. Wall detection & alignment
+        3. Wall following (main behavior)
+        4. Wall search
         """
         if self._shutting_down:
             return
 
-        # Extract scan properties
         angle_min = scan.angle_min
         angle_inc = scan.angle_increment
 
-        # Initialize sector arrays to classify LIDAR rays by direction
-        FRONT      = []      # Forward direction (-20° to +20°)
-        FR_RIGHT   = []      # Forward-right diagonal (-60° to -20°)
-        RIGHT      = []      # Right side (-120° to -60°)
-        BACK_RIGHT = []      # Back-right diagonal (-160° to -120°)
-        BACK       = []      # Behind robot (±160° to ±180°)
-        BACK_LEFT  = []      # Back-left diagonal (+120° to +160°)
-        LEFT       = []      # Left side (+60° to +120°)
-        FR_LEFT    = []      # Forward-left diagonal (+20° to +60°)
+        # Initialize sector arrays
+        FRONT      = []
+        FR_RIGHT   = []
+        RIGHT      = []
+        BACK_RIGHT = []
+        BACK       = []
+        BACK_LEFT  = []
+        LEFT       = []
+        FR_LEFT    = []
 
-        # Step 1: LIDAR data classification into angular sectors
-        # This allows us to analyze obstacles in different directions
+        # Step 1: Classify LIDAR rays by angular sector
         for i, d in enumerate(scan.ranges):
-            # Skip invalid readings (NaN or infinity)
             if not math.isfinite(d):
                 continue
-            # Skip out-of-range readings (sensor limits)
             if d < scan.range_min or d > scan.range_max:
                 continue
 
-            # Calculate the angle of this LIDAR ray
             ang = angle_min + i * angle_inc
 
-            # Classify the ray into the appropriate sector
             if -math.radians(20) <= ang <= math.radians(20):
                 FRONT.append(d)
             elif -math.radians(60) <= ang < -math.radians(20):
@@ -153,7 +206,6 @@ class WallFollower(Node):
                 BACK.append(d)
 
         # Step 2: Extract minimum distances per sector
-        # These represent the closest obstacle in each direction
         min_front      = min(FRONT)      if FRONT      else float('inf')
         min_fr_right   = min(FR_RIGHT)   if FR_RIGHT   else float('inf')
         min_right      = min(RIGHT)      if RIGHT      else float('inf')
@@ -165,14 +217,13 @@ class WallFollower(Node):
 
         # ========================================================================
         # STATE 1: EMERGENCY COLLISION AVOIDANCE
-        # Triggered when ANY obstacle is extremely close (< base_distance)
+        # Triggered when ANY obstacle is extremely close
         # ========================================================================
         closest_dist = min(min_front, min_left, min_right, min_back, 
                         min_fr_left, min_fr_right, min_back_left, min_back_right)
 
         twist = Twist()
-        if closest_dist < self.base_distance:
-            # Find which direction offers the most clearance to escape
+        if closest_dist < self.base_distance * 0.75:  # Even tighter emergency threshold
             directions = {
                 "FRONT":      min_front,
                 "LEFT":       min_left,
@@ -181,33 +232,82 @@ class WallFollower(Node):
             }
             best_zone = max(directions, key=directions.get)
 
-            # Execute appropriate escape maneuver based on clearest direction
             if best_zone == "FRONT" or best_zone == "LEFT":
-                # Rotate left (counterclockwise) to escape
                 twist.linear.x = 0.0
                 twist.angular.z = 0.5
                 action = "EMERGENCY: Turn LEFT"
             elif best_zone == "RIGHT":
-                # Rotate right (clockwise) to escape
                 twist.linear.x = 0.0
                 twist.angular.z = -0.5
                 action = "EMERGENCY: Turn RIGHT"
-            else:  # BACK is clearest
-                # Retreat backward
+            else:
                 twist.linear.x = -self.forwardSpeed
                 twist.angular.z = 0.0
                 action = "EMERGENCY: Move BACK"
 
+            self._aligning_to_wall = False
             self.cmd = twist
             self._state_action = action
             return
 
         # ========================================================================
-        # STATE 2: FRONTAL OBSTACLE DETECTION
-        # Triggered when obstacle directly ahead (< 2x safety distance)
+        # STATE 2: WALL DETECTION & ALIGNMENT
+        # Triggered when a wall is detected at reduced distance
+        # Robot stops, aligns parallel to wall, then proceeds
+        # ========================================================================
+        closest_wall_dist, wall_side, primary_dist, secondary_dist = self.find_closest_wall(
+            min_front, min_left, min_right, min_fr_left, min_fr_right
+        )
+
+        if closest_wall_dist < self.base_distance and not self._aligning_to_wall:
+            # Wall detected! Enter alignment mode
+            self._aligning_to_wall = True
+            self._target_wall_side = wall_side
+            angle_error = self.calculate_wall_angle_error(primary_dist, secondary_dist, wall_side)
+            self._target_angle_error = angle_error
+
+            action = f"Wall detected ({wall_side}) at {closest_wall_dist:.3f}m → Starting alignment"
+            self.cmd = Twist()  # Stop all motion
+            self._state_action = action
+            return
+
+        # ========================================================================
+        # STATE 2B: WALL ALIGNMENT IN PROGRESS
+        # Rotate until robot is parallel to detected wall
+        # ========================================================================
+        if self._aligning_to_wall:
+            angle_error = self.calculate_wall_angle_error(primary_dist, secondary_dist, self._target_wall_side)
+
+            # Check if alignment is complete
+            if self.is_wall_aligned(angle_error):
+                self._aligning_to_wall = False
+                action = f"Wall aligned! ({self._target_wall_side}) - Ready to move"
+                self.cmd = Twist()
+                self._state_action = action
+                return
+
+            # Rotate toward wall with proportional control
+            # For RIGHT wall: negative rotation (clockwise)
+            # For LEFT wall: positive rotation (counterclockwise)
+            # For FRONT wall: already aligned (perpendicular)
+            rotation_direction = -1.0 if self._target_wall_side == "RIGHT" else 1.0
+
+            if self._target_wall_side == "FRONT":
+                twist.angular.z = 0.0
+            else:
+                # Proportional rotation: stronger rotation for larger angle errors
+                twist.angular.z = rotation_direction * min(0.5, abs(angle_error) * 2.0)
+
+            twist.linear.x = 0.0
+            action = f"Aligning to {self._target_wall_side} wall | angle_err={angle_error:.3f}"
+            self.cmd = twist
+            self._state_action = action
+            return
+
+        # ========================================================================
+        # STATE 3: FRONTAL OBSTACLE (normal operation)
         # ========================================================================
         if min_front < self.base_distance * 2:
-            # Stop forward motion and rotate left to find wall or clear path
             twist.linear.x = 0.0
             twist.angular.z = 0.4
             action = "Obstacle FRONT → Turn LEFT"
@@ -216,12 +316,9 @@ class WallFollower(Node):
             return
 
         # ========================================================================
-        # STATE 3: LEFT SIDE OBSTACLE CORRECTION
-        # Triggered when robot gets too close to left wall
-        # This prevents wall collision while maintaining wall-follow mission
+        # STATE 4: LEFT SIDE CORRECTION
         # ========================================================================
         if min_left < self.base_distance:
-            # Move forward while steering right to create distance from left wall
             twist.linear.x = self.forwardSpeed
             twist.angular.z = -0.4
             action = "Obstacle LEFT → Correct RIGHT"
@@ -230,27 +327,17 @@ class WallFollower(Node):
             return
 
         # ========================================================================
-        # STATE 4: WALL FOLLOWING (Primary Behavior)
+        # STATE 5: WALL FOLLOWING (Primary Behavior)
         # Tracks a wall on the right side at constant desired distance
-        # Uses proportional control for both distance and angle corrections
         # ========================================================================
-        DESIRED_RIGHT_DIST = 0.25  # Target distance to wall (meters)
-        
         if math.isfinite(min_right):
-            # Calculate distance error: positive = too far, negative = too close
-            error_dist = min_right - DESIRED_RIGHT_DIST
+            error_dist = min_right - self.DESIRED_WALL_DIST
 
-            # Calculate angle error using front and back right distances
-            # This ensures the robot stays parallel to the wall
             if math.isfinite(min_back_right):
-                # Positive error_angle = robot angled away from wall, needs correction
                 error_angle = min_right - min_back_right
             else:
                 error_angle = 0.0
 
-            # Proportional controller for smooth wall following
-            # - Positive angular velocity = rotate left (away from right wall)
-            # - Negative angular velocity = rotate right (toward right wall)
             twist.linear.x = self.forwardSpeed
             twist.angular.z = -1.2 * error_dist - 1.0 * error_angle
 
@@ -260,12 +347,10 @@ class WallFollower(Node):
             return
 
         # ========================================================================
-        # STATE 5: WALL SEARCH (Lost the Wall)
-        # Triggered when no wall is detected on the right side
-        # Executes slow right turn to locate the wall again
+        # STATE 6: WALL SEARCH (Lost the wall)
         # ========================================================================
         twist.linear.x = self.forwardSpeed
-        twist.angular.z = -0.5  # Slow rotation to the right (toward wall)
+        twist.angular.z = -0.5
         action = "Searching RIGHT wall"
         self.cmd = twist
         self._state_action = action
@@ -293,4 +378,3 @@ def main(args=None):
 
 if __name__ == '__main__':
     main()
-

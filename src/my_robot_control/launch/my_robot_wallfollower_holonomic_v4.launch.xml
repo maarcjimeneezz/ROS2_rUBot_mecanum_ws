@@ -1,0 +1,22 @@
+<?xml version="1.0"?>
+<launch>
+    <!-- Parámetros -->
+    <arg name="distance_limit"   default="0.5" />
+    <arg name="forward_speed"    default="0.2" />
+    <arg name="side_speed"       default="0.2" />
+    <arg name="rotation_speed"   default="0.3" />
+    <arg name="time_to_stop"     default="80.0" />
+
+    <node
+        pkg="my_robot_control"
+        exec="my_robot_wallfollower_holonomic_v4_exec"
+        name="wall_follower_node"
+        output="screen">
+
+        <param name="distance_limit"   value="$(var distance_limit)" />
+        <param name="forward_speed"    value="$(var forward_speed)" />
+        <param name="side_speed"       value="$(var side_speed)" />
+        <param name="rotation_speed"   value="$(var rotation_speed)" />
+        <param name="time_to_stop"     value="$(var time_to_stop)" />
+    </node>
+</launch>
